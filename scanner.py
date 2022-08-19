@@ -3,70 +3,101 @@
 Usage:
     scanner.py -h | --help
     scanner.py -i <interface>
+    scanner.py -l | --list
 
 Options:
     -h --help   Show this help message
     -i          Network interface to sniff packets from
+    -l --list   List the available interfaces
 """
 import os
 import time
+import logging
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 import docopt
-import pandas
 from threading import Thread
 
-# initialize the networks dataframe that will contain all access points nearby
-from scapy.sendrecv import sniff
-from scapy.layers.dot11 import Dot11Beacon, Dot11, Dot11Elt
+import psutil
+import tabulate
+from wifi import Cell
+from wifi.exceptions import InterfaceError
 
-networks = pandas.DataFrame(
-    columns=["BSSID", "SSID", "dBm_Signal", "Channel", "Crypto"]
-)
-# set the index BSSID (MAC address of the AP)
-networks.set_index("BSSID", inplace=True)
+headers = ["SSID", "Address", "Chnl", "Sig", "Last seen"]
+networks = {}
+
+# create logger with 'spam_application'
+logger = logging.getLogger('scanner')
+logger.setLevel(logging.DEBUG)
+fh = RotatingFileHandler('/home/pi/network_scanner.log', maxBytes=1000000, backupCount=2)
+fh.setLevel(logging.DEBUG)
+formatter = logging.Formatter('%(message)s')
+fh.setFormatter(formatter)
+# add the handlers to the logger
+logger.addHandler(fh)
 
 
-def callback(packet):
-    if packet.haslayer(Dot11Beacon):
-        # extract the MAC address of the network
-        bssid = packet[Dot11].addr2
+def _get_timestamp():
+    return datetime.utcfromtimestamp(time.time()).strftime("%d/%m %H:%M:%S")
 
-        # get the name of it
-        ssid = packet[Dot11Elt].info.decode()
+
+def _list_networks():
+    networks_list = []
+    for net in sorted(networks):
+        networks_list.append([net] + networks[net])
+
+    return networks_list
+
+
+def scan_networks(interface):
+    while True:
         try:
-            dbm_signal = packet.dBm_AntSignal
-        except:
-            dbm_signal = "N/A"
+            cells = Cell.all(interface)
+        except InterfaceError:
+            print(
+                f"Interface {interface} was busy (Or some other error occurred). Trying again..."
+            )
+            time.sleep(1)
+            continue
 
-        # extract network stats
-        stats = packet[Dot11Beacon].network_stats()
+        # Loop over the available cells
+        for cell in cells:
+            ssid = f"{cell.ssid[:15]} ({cell.frequency[:3]})"
+            networks[ssid] = [
+                cell.address,
+                cell.channel,
+                cell.signal,
+                _get_timestamp(),
+            ]
+            logger.info(f"{_get_timestamp()} | "
+                        f"{cell.address} | "
+                        f"{cell.channel} | "
+                        f"{cell.signal} | "
+                        f"{ssid}")
 
-        # get the channel of the AP
-        channel = stats.get("channel")
-
-        # get the crypto
-        crypto = stats.get("crypto")
-        networks.loc[bssid] = (ssid, dbm_signal, channel, crypto)
+        time.sleep(5)
 
 
 def print_all():
     while True:
         os.system("clear")
-        print(networks)
-        time.sleep(0.5)
+        print(tabulate.tabulate(_list_networks(), headers=headers, tablefmt="pretty"))
+        time.sleep(10)
 
 
-def change_channel():
-    ch = 1
-    while True:
-        os.system(f"iwconfig {interface} channel {ch}")
-        # switch channel from 1 to 14 each 0.5s
-        ch = ch % 14 + 1
-        time.sleep(0.5)
+def display_interfaces():
+    addrs = psutil.net_if_addrs()
+    for interface in addrs.keys():
+        print(interface)
 
 
 if __name__ == "__main__":
     args = docopt.docopt(__doc__)
+    if args["--list"]:
+        display_interfaces()
+        exit()
+
     interface = args["<interface>"]
 
     # start the thread that prints all the networks
@@ -74,10 +105,9 @@ if __name__ == "__main__":
     printer.daemon = True
     printer.start()
 
-    # start the channel changer
-    channel_changer = Thread(target=change_channel)
-    channel_changer.daemon = True
-    channel_changer.start()
+    scan_networks(interface)
 
-    # start sniffing
-    sniff(prn=callback, iface=interface)
+    # # start the channel changer
+    # channel_changer = Thread(target=change_channel)
+    # channel_changer.daemon = True
+    # channel_changer.start()
